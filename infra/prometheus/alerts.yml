@@ -1,0 +1,58 @@
+groups:
+  - name: async_jobs_alerts
+    interval: 30s
+    rules:
+
+      # -----------------------------------------------------------------------
+      # DLQ size exceeds threshold
+      # -----------------------------------------------------------------------
+      - alert: DLQSizeHigh
+        expr: dlq_size > 10
+        for: 2m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "DLQ size is high: {{ $value }} messages"
+          description: >
+            The Dead Letter Queue contains {{ $value }} messages, which exceeds
+            the threshold of 10. This indicates a pattern of task failures that
+            requires investigation.
+          runbook_url: "https://wiki.internal/runbooks/dlq-high"
+
+      # -----------------------------------------------------------------------
+      # Error rate high over last 5 minutes
+      # -----------------------------------------------------------------------
+      - alert: ErrorRateHigh
+        expr: >
+          (
+            sum(rate(jobs_total{status="failed"}[5m]))
+            /
+            (sum(rate(jobs_total[5m])) > 0)
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Job error rate above 1% (current: {{ $value | humanizePercentage }})"
+          description: >
+            More than 1% of jobs in the last 5 minutes have failed.
+            Current rate: {{ $value | humanizePercentage }}.
+          runbook_url: "https://wiki.internal/runbooks/error-rate-high"
+
+      # -----------------------------------------------------------------------
+      # No active workers
+      # -----------------------------------------------------------------------
+      - alert: WorkerDown
+        expr: active_workers == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "No active Celery workers detected"
+          description: >
+            The active_workers gauge has been 0 for more than 2 minutes.
+            All submitted jobs will accumulate in the queue without being processed.
+          runbook_url: "https://wiki.internal/runbooks/worker-down"

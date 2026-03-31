@@ -1,0 +1,364 @@
+name: CI — Async Jobs System
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main", "develop"]
+
+env:
+  PYTHON_VERSION: "3.12"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Lint + Type Check
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install lint dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ruff mypy black
+
+      - name: Run ruff (linter)
+        run: ruff check app/ workers/ tests/ --output-format=github
+
+      - name: Run black (formatter check)
+        run: black --check app/ workers/ tests/
+
+      - name: Run mypy (type checker)
+        run: |
+          pip install -r requirements.txt 2>/dev/null || pip install .
+          mypy app/ workers/ --ignore-missing-imports --strict
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: Static Security Analysis
+  # ─────────────────────────────────────────────────────────────────────────
+  security-static:
+    name: Security — Static Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install security tools
+        run: |
+          pip install pip-audit bandit detect-secrets
+
+      - name: Install project dependencies
+        run: pip install .
+
+      - name: pip-audit — dependency CVE scan
+        run: pip-audit --format json --output pip-audit-report.json
+        continue-on-error: false
+
+      - name: bandit — code security scan (HIGH severity)
+        run: |
+          bandit -r app/ workers/ \
+            --severity-level high \
+            --confidence-level medium \
+            --format json \
+            --output bandit-report.json || true
+          python -c "
+          import json, sys
+          with open('bandit-report.json') as f:
+            report = json.load(f)
+          highs = [i for i in report.get('results', []) if i['issue_severity'] == 'HIGH']
+          if highs:
+            print(f'FAIL: {len(highs)} HIGH severity issues found:')
+            for i in highs:
+              print(f'  {i[\"filename\"]}:{i[\"line_number\"]}: {i[\"issue_text\"]}')
+            sys.exit(1)
+          print(f'OK: No HIGH severity issues.')
+          "
+
+      - name: detect-secrets — hardcoded credentials scan
+        run: |
+          detect-secrets scan --all-files \
+            --exclude-files '\.git' \
+            --exclude-files '\.env\.example' \
+            --exclude-files 'tests/' \
+            > secrets-baseline.json
+          python -c "
+          import json, sys
+          with open('secrets-baseline.json') as f:
+            baseline = json.load(f)
+          total = sum(len(v) for v in baseline.get('results', {}).values())
+          if total > 0:
+            print(f'FAIL: {total} potential secrets detected')
+            print(json.dumps(baseline['results'], indent=2))
+            sys.exit(1)
+          print('OK: No hardcoded secrets detected.')
+          "
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            pip-audit-report.json
+            bandit-report.json
+            secrets-baseline.json
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3: Unit Tests
+  # ─────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest tests/unit/ \
+            -m unit \
+            -v \
+            --cov=app \
+            --cov=workers \
+            --cov-report=xml:coverage-unit.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=85 \
+            --junitxml=junit-unit.xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-unit
+          path: coverage-unit.xml
+
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-unit
+          path: junit-unit.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 4: Integration Tests (testcontainers)
+  # ─────────────────────────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: unit-tests
+
+    services:
+      # Precondition: Docker daemon available (default on ubuntu-latest)
+      docker:
+        image: docker:24-dind
+        options: --privileged
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+
+      - name: Pull container images (cache)
+        run: |
+          docker pull redis:7-alpine
+          docker pull postgres:16-alpine
+
+      - name: Run integration tests
+        env:
+          SECRET_KEY: "ci-test-secret-key-32-chars-long!!"
+          JWT_SECRET_KEY: "ci-jwt-secret-key-32-chars-long!!"
+        run: |
+          pytest tests/integration/ \
+            -m integration \
+            -v \
+            --cov=app \
+            --cov=workers \
+            --cov-report=xml:coverage-integration.xml \
+            --cov-fail-under=80 \
+            --junitxml=junit-integration.xml \
+            --timeout=120
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-integration
+          path: coverage-integration.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 5: Security Dynamic (pentest + vulnerabilities)
+  # ─────────────────────────────────────────────────────────────────────────
+  security-dynamic:
+    name: Security — Dynamic Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: integration-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+
+      - name: Pull container images
+        run: |
+          docker pull redis:7-alpine
+          docker pull postgres:16-alpine
+
+      - name: Run security tests
+        env:
+          SECRET_KEY: "ci-test-secret-key-32-chars-long!!"
+          JWT_SECRET_KEY: "ci-jwt-secret-key-32-chars-long!!"
+        run: |
+          pytest tests/security/ \
+            -m security \
+            -v \
+            --junitxml=junit-security.xml \
+            --timeout=60
+
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-security
+          path: junit-security.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 6: Chaos Tests (only on push to main)
+  # ─────────────────────────────────────────────────────────────────────────
+  chaos-tests:
+    name: Chaos Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Only runs on push to main — not on PRs (too slow + requires full Docker)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: security-dynamic
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+
+      - name: Pull container images
+        run: |
+          docker pull redis:7-alpine
+          docker pull postgres:16-alpine
+
+      - name: Run chaos tests
+        env:
+          SECRET_KEY: "ci-test-secret-key-32-chars-long!!"
+          JWT_SECRET_KEY: "ci-jwt-secret-key-32-chars-long!!"
+        run: |
+          pytest tests/chaos/ \
+            -m chaos \
+            -v \
+            --junitxml=junit-chaos.xml \
+            --timeout=300
+
+      - name: Upload JUnit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-chaos
+          path: junit-chaos.xml
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 7: Final coverage gate (all tests combined)
+  # ─────────────────────────────────────────────────────────────────────────
+  coverage-gate:
+    name: Coverage Gate (90% minimum)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [unit-tests, integration-tests]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[test]"
+
+      - name: Pull container images
+        run: |
+          docker pull redis:7-alpine
+          docker pull postgres:16-alpine
+
+      - name: Run full test suite for coverage gate
+        env:
+          SECRET_KEY: "ci-test-secret-key-32-chars-long!!"
+          JWT_SECRET_KEY: "ci-jwt-secret-key-32-chars-long!!"
+        run: |
+          pytest tests/unit/ tests/integration/ \
+            -m "unit or integration" \
+            --cov=app \
+            --cov=workers \
+            --cov-report=xml:coverage-combined.xml \
+            --cov-report=html:coverage-html \
+            --cov-fail-under=90 \
+            --timeout=120
+
+      - name: Upload combined coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-combined
+          path: |
+            coverage-combined.xml
+            coverage-html/

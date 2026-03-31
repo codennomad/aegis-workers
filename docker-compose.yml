@@ -1,0 +1,252 @@
+---
+# =============================================================================
+# Async Jobs System — Production Docker Compose
+# Sobe tudo com um único: docker compose up
+# =============================================================================
+# Serviços: fastapi, celery-worker (--concurrency=4), celery-beat,
+#           celery-flower, redis, postgres, prometheus, grafana, loki, promtail
+# =============================================================================
+
+x-common-env: &common-env
+  DATABASE_URL: postgresql+asyncpg://asyncjobs:changeme@postgres:5432/asyncjobs
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  SECRET_KEY: dev-secret-key-change-in-production-32ch
+  JWT_SECRET_KEY: dev-jwt-secret-key-change-in-production
+  APP_ENV: development
+  LOG_LEVEL: INFO
+  OTEL_SERVICE_NAME: async-jobs-api
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+
+x-celery-base: &celery-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    <<: *common-env
+  depends_on:
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  networks:
+    - internal
+  restart: unless-stopped
+
+networks:
+  internal:
+    driver: bridge
+    internal: false  # allow outbound for OTLP export; tighten in prod
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+
+services:
+
+  # ===========================================================================
+  # API
+  # ===========================================================================
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: async-jobs-api
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2"
+    environment:
+      <<: *common-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/jobs/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Celery Workers
+  # ===========================================================================
+  celery-worker:
+    <<: *celery-base
+    container_name: async-jobs-worker
+    command: celery -A workers.celery_app.celery_app worker --concurrency=4 --loglevel=info --queues=default,dlq
+    healthcheck:
+      test: ["CMD", "celery", "-A", "workers.celery_app.celery_app", "inspect", "ping", "--timeout=5"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  celery-beat:
+    <<: *celery-base
+    container_name: async-jobs-beat
+    command: celery -A workers.celery_app.celery_app beat --loglevel=info --scheduler celery.beat:PersistentScheduler
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/celerybeat-schedule"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  celery-flower:
+    <<: *celery-base
+    container_name: async-jobs-flower
+    command: celery -A workers.celery_app.celery_app flower --port=5555 --broker=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/api/workers"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ===========================================================================
+  # Data stores
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: async-jobs-redis
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: async-jobs-postgres
+    environment:
+      POSTGRES_DB: asyncjobs
+      POSTGRES_USER: asyncjobs
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asyncjobs -d asyncjobs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ===========================================================================
+  # Observability — Prometheus + Grafana
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    container_name: async-jobs-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: async-jobs-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_DOMAIN: localhost
+      GF_LOG_LEVEL: warn
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ===========================================================================
+  # Observability — Loki + Promtail
+  # ===========================================================================
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: async-jobs-loki
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./infra/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  promtail:
+    image: grafana/promtail:3.2.0
+    container_name: async-jobs-promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./infra/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - internal
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9080/targets"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
