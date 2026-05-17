@@ -95,7 +95,7 @@ def create_app() -> FastAPI:
     secure_headers = secure.Secure(
         server=secure.Server().set(""),  # Hide server header
         xfo=secure.XFrameOptions().deny(),
-        xct=secure.XContentTypeOptions(),
+        xcto=secure.XContentTypeOptions(),
         hsts=secure.StrictTransportSecurity().max_age(31536000),
     )
 
@@ -104,7 +104,7 @@ def create_app() -> FastAPI:
         from collections.abc import Callable
         assert callable(call_next)
         response: Response = await call_next(request)  # type: ignore[misc]
-        secure_headers.framework.fastapi(response)  # type: ignore[attr-defined]
+        await secure_headers.set_headers_async(response)  # type: ignore[arg-type]
         response.headers.pop("x-powered-by", None)
         return response
 
