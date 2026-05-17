@@ -105,7 +105,10 @@ def create_app() -> FastAPI:
         assert callable(call_next)
         response: Response = await call_next(request)  # type: ignore[misc]
         await secure_headers.set_headers_async(response)  # type: ignore[arg-type]
-        response.headers.pop("x-powered-by", None)
+        try:
+            del response.headers["x-powered-by"]
+        except KeyError:
+            pass
         return response
 
     # -------------------------------------------------------------------------
